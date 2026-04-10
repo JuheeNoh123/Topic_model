@@ -47,10 +47,25 @@ T_OFF_SIM = 0.30
 # 점수 산출에서는 글 품질 비중을 더 크게 반영
 ALPHA = 0.35  # final = 0.35 × topic_score + 0.65 × quality_score
 
-# sentence_evidence에서 off-topic 문장을 표시할 조건
-ABS_OFF_TH = 0.35   # 문장 유사도가 이 값보다 낮아야 off_topic 후보
-GAP_TH     = 0.20   # best_sim - worst_sim이 이 값보다 커야 off_topic 후보
-# ==================================================
+
+# ── 문장 수준 topic score 집계 가중치 ────────────────────────────────────────
+# W_AVG + W_MIN + W_COH = 0.9 (합이 1.0이 아닌 이유: penalty 여유분 확보)
+W_AVG = 0.50  # 문장별 cosine 평균  — 전반적 주제 부합도
+W_MIN = 0.20  # 문장별 cosine 최솟값 — 가장 이탈한 문장 패널티
+W_COH = 0.20  # 인접 문장 coherence  — 문맥 흐름 연속성
+
+
+# ── penalty 파라미터 ─────────────────────────────────────────────────────────
+# off-topic 문장(sim < PENALTY_TH) 비율에 비례해서 0~PENALTY_W 만큼 감점
+# penalty = PENALTY_W × (PENALTY_TH 미만 문장 수 / 전체 문장 수)
+PENALTY_TH = 0.30   # 이 값 미만인 문장을 off-topic으로 간주
+PENALTY_W  = 0.50   # 최대 감점폭 (0~3 스케일 기준, 약 17/100 point)
+
+
+# ── sentence_evidence 표시 조건 ──────────────────────────────────────────────
+ABS_OFF_TH = 0.35   # 문장 유사도 절대값이 이 값보다 낮아야 off_topic 후보
+GAP_TH     = 0.20   # best_sim - worst_sim 차이가 이 값보다 커야 표시
+# ==============================================================================
 
 
 def clip01(x: float) -> float:
@@ -63,27 +78,24 @@ def score3_to_100(x: float) -> int:
     return int(max(0, min(100, round((x / 3.0) * 100))))
 
 
-def sim_to_topic_score(sim: float) -> float:
+def sim_to_topic_score(
+    sim: float,
+    sim_min: float = SIM_MIN,
+    sim_max: float = SIM_MAX,
+) -> float:
     """
-    코사인 유사도(sim)를 0~3 연속 점수로 캘리브레이션.
-
-    SIM_MIN(0.15) 이하 → 0점, SIM_MAX(0.90) 이상 → 3점, 그 사이는 선형 보간.
-    범위 밖 값은 clip01()로 0~1로 제한.
+    코사인 유사도를 0~3 연속 점수로 캘리브레이션.
+    sim_min/sim_max를 인자로 받아 동적 정규화를 지원.
+    (sentence_analysis의 문장별 topic_score 계산에서 사용)
     """
-    norm = (sim - SIM_MIN) / (SIM_MAX - SIM_MIN + 1e-12)
-    norm = clip01(float(norm))
-    return 3.0 * norm
+    norm = (sim - sim_min) / (sim_max - sim_min + 1e-12)
+    return 3.0 * clip01(float(norm))
 
 
 def build_anchor_text(summary: str, desc: str, tags: List[str]) -> str:
     """
     주제 정보(summary, desc, tags)를 anchor 텍스트로 변환.
     학습(make_anchor.py)과 동일한 포맷 사용 → 학습-서비스 일관성 보장.
-
-    출력 예시:
-      [요약] 직업 선택의 중요성
-      [설명] 직업을 고를 때 고려해야 할 조건들
-      [태그] #직업 #선택 #가치관
     """
     tags     = [t.lstrip("#").strip() for t in (tags or []) if t and t.strip()]
     tags     = [f"#{t}" for t in tags][:3]
@@ -145,44 +157,174 @@ class ServiceScorer:
     """
 
     def __init__(self):
-        # 주제 적합성 임베딩 모델 (KoSimCSE 파인튜닝)
         self.topic_model = SentenceTransformer(str(TOPIC_MODEL_PATH))
-
-        # 문장 품질 분류 모델 (klue/roberta-base 파인튜닝)
         self.tokenizer   = AutoTokenizer.from_pretrained(str(LABEL_MODEL_PATH))
-        self.label_model = AutoModelForSequenceClassification.from_pretrained(str(LABEL_MODEL_PATH))
+        self.label_model = AutoModelForSequenceClassification.from_pretrained(
+            str(LABEL_MODEL_PATH)
+        )
         self.label_model.eval()
-
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.label_model.to(self.device)
 
-    def topic_similarity(self, anchor: str, doc: str) -> float:
+    # ── 임베딩 헬퍼 ───────────────────────────────────────────────────────────
+
+    def _encode_sentences(
+        self, anchor: str, doc: str
+    ) -> Tuple[List[str], Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
         """
-        anchor와 doc 텍스트의 코사인 유사도 계산.
-        두 텍스트를 임베딩 후 내적(normalize된 벡터이므로 내적 = 코사인 유사도).
-        반환값: -1~1 사이 (실제로는 대부분 0~1)
+        문서를 문장 단위로 분리하고 anchor와 각 문장을 한 번에 임베딩.
+        predict() 내에서 한 번만 호출해 중복 인코딩을 방지.
+
+        Returns:
+            sents      : 분리된 문장 목록
+            sent_vecs  : 각 문장 임베딩 (N, D) — 문장이 없으면 None
+            anchor_vec : anchor 임베딩 (D,)   — 문장이 없으면 None
+            sims       : 문장별 anchor cosine similarity (N,)
         """
-        a = self.topic_model.encode([anchor], normalize_embeddings=True, convert_to_numpy=True)[0]
-        d = self.topic_model.encode([doc],    normalize_embeddings=True, convert_to_numpy=True)[0]
-        return float(a @ d)
+        sents = split_sentences(doc)
+        if not sents:
+            return sents, None, None, np.array([])
+
+        anchor_vec = self.topic_model.encode(
+            [anchor], normalize_embeddings=True, convert_to_numpy=True
+        )[0]
+        sent_vecs = self.topic_model.encode(
+            sents, normalize_embeddings=True, convert_to_numpy=True
+        )
+        sims = (sent_vecs @ anchor_vec).astype(float)
+        return sents, sent_vecs, anchor_vec, sims
+
+    # ── 품질 점수 ─────────────────────────────────────────────────────────────
 
     @torch.inference_mode()
     def quality_score(self, doc: str) -> float:
         """
-        문장 품질을 낮음/보통/높음 3단계로 분류 후 확률 가중합으로 0~2 연속값 반환.
-
-        단순 argmax(가장 높은 확률 클래스)가 아닌 확률 가중합을 쓰는 이유:
-          "거의 높음"인 경우 1.8, "낮음/보통 반반"인 경우 0.5 같은
-          부드러운 연속 값을 얻어 점수 변화가 더 자연스러움.
-
-        반환값: 0~2 연속값 (0=낮음, 1=보통, 2=높음)
+        단일 텍스트의 품질 점수 (0~2 연속값).
+        확률 가중합: p_보통×1 + p_높음×2
+        predict()에서 전체 문서 품질 측정 시 사용.
         """
         enc    = self.tokenizer(doc, return_tensors="pt", truncation=True, max_length=256)
         enc    = {k: v.to(self.device) for k, v in enc.items()}
         logits = self.label_model(**enc).logits
-        probs  = torch.softmax(logits, dim=1)[0]   # [p_낮음, p_보통, p_높음]
-        score  = probs[0] * 0.0 + probs[1] * 1.0 + probs[2] * 2.0
-        return float(score)
+        probs  = torch.softmax(logits, dim=1)[0]
+        return float(probs[1] * 1.0 + probs[2] * 2.0)
+
+    @torch.inference_mode()
+    def _batch_quality_scores(self, texts: List[str]) -> List[float]:
+        """
+        여러 텍스트의 품질 점수를 배치로 한 번에 계산.
+        sentence_analysis()에서 문장별 순차 호출 대신 사용 → 추론 속도 개선.
+
+        Returns: 각 텍스트의 품질 점수 리스트 (0~2 연속값)
+        """
+        if not texts:
+            return []
+        enc = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            truncation=True,
+            max_length=256,
+            padding=True,
+        )
+        enc    = {k: v.to(self.device) for k, v in enc.items()}
+        logits = self.label_model(**enc).logits           # (N, 3)
+        probs  = torch.softmax(logits, dim=1)             # (N, 3)
+        scores = (probs[:, 1] * 1.0 + probs[:, 2] * 2.0).cpu().tolist()
+        return [float(s) for s in scores]
+
+    # ── topic score 집계 ──────────────────────────────────────────────────────
+
+    def _compute_coherence(self, sent_vecs: Optional[np.ndarray]) -> float:
+        """
+        인접 문장 쌍의 cosine similarity 평균으로 문맥 연결성(coherence) 계산.
+          coherence = mean(sim(sent_i, sent_{i+1}))  for i in 0..N-2
+
+        문장이 1개뿐이면 인접 쌍이 없어 coherence 기반 감점이 불가능 → 1.0 반환.
+        """
+        if sent_vecs is None or len(sent_vecs) < 2:
+            return 1.0
+        pair_sims = [
+            float(sent_vecs[i] @ sent_vecs[i + 1])
+            for i in range(len(sent_vecs) - 1)
+        ]
+        return float(np.mean(pair_sims))
+
+    def _aggregate_topic(
+        self,
+        sims: np.ndarray,
+        sent_vecs: Optional[np.ndarray],
+    ) -> Tuple[float, dict]:
+        """
+        문장별 anchor cosine similarity로부터 topic_score_3(0~3)을 계산.
+
+        처리 단계:
+          1. topic_avg / topic_min / coherence 계산
+          2. 동적 percentile로 정규화 기준 결정
+             문장 수 >= MIN_SENTS_PERCENTILE(4) → sims의 p5/p95 사용
+             문장 수 부족 → 하드코딩 fallback (SIM_MIN/SIM_MAX)
+          3. 각 성분을 독립적으로 정규화 후 가중 평균 → 0~3
+             score_3 = 3 × (W_AVG·norm(avg) + W_MIN·norm(min) + W_COH·norm(coh))
+                           ─────────────────────────────────────────────────────
+                                         W_AVG + W_MIN + W_COH
+          4. off-topic 비율 기반 penalty 감점
+             penalty = PENALTY_W × (sims < PENALTY_TH 문장 비율)
+
+        Returns:
+            topic_score_3 : 0~3 연속값
+            debug         : 내부 계산값 딕셔너리
+        """
+        if len(sims) == 0:
+            return 0.0, {}
+
+        topic_avg = float(np.mean(sims))
+        topic_min = float(np.min(sims))
+        coherence = self._compute_coherence(sent_vecs)
+
+        # ── 동적 정규화 기준 결정 ──────────────────────────────────────────
+        if len(sims) >= MIN_SENTS_PERCENTILE:
+            dyn_min = float(np.percentile(sims, SIM_NORM_P_LOW))
+            dyn_max = float(np.percentile(sims, SIM_NORM_P_HIGH))
+        else:
+            dyn_min, dyn_max = SIM_MIN, SIM_MAX
+
+        def norm_val(v: float) -> float:
+            return clip01((v - dyn_min) / (dyn_max - dyn_min + 1e-12))
+
+        # ── 가중 평균 → 0~3 ───────────────────────────────────────────────
+        w_sum   = W_AVG + W_MIN + W_COH   # 0.9
+        score_3 = 3.0 * (
+            W_AVG * norm_val(topic_avg) +
+            W_MIN * norm_val(topic_min) +
+            W_COH * norm_val(coherence)
+        ) / w_sum
+
+        # ── penalty ───────────────────────────────────────────────────────
+        off_ratio = float(np.mean(sims < PENALTY_TH))
+        penalty   = PENALTY_W * off_ratio    # 0 ~ PENALTY_W
+        score_3   = max(0.0, score_3 - penalty)
+
+        debug = {
+            "topic_avg":   round(topic_avg,  4),
+            "topic_min":   round(topic_min,  4),
+            "coherence":   round(coherence,  4),
+            "off_ratio":   round(off_ratio,  4),
+            "penalty":     round(penalty,    4),
+            "dyn_sim_min": round(dyn_min,    4),
+            "dyn_sim_max": round(dyn_max,    4),
+        }
+        return score_3, debug
+
+    # ── 공개 API ──────────────────────────────────────────────────────────────
+
+    def topic_similarity(self, anchor: str, doc: str) -> float:
+        """
+        anchor와 doc 전체 텍스트의 코사인 유사도.
+        단독 사용 또는 디버그용으로 유지.
+        predict() 내에서는 _encode_sentences()를 사용하므로 이 메서드는 호출되지 않음.
+        """
+        a = self.topic_model.encode([anchor], normalize_embeddings=True, convert_to_numpy=True)[0]
+        d = self.topic_model.encode([doc],    normalize_embeddings=True, convert_to_numpy=True)[0]
+        return float(a @ d)
 
     def sentence_evidence(
         self,
@@ -192,39 +334,36 @@ class ServiceScorer:
         gap_th: float = GAP_TH,
         top_k_on: int = 1,
         top_k_off: int = 1,
+        *,
+        _sents: Optional[List[str]] = None,
+        _sims: Optional[np.ndarray] = None,
     ) -> Dict[str, List[str]]:
         """
         주제와 가장 가까운 문장(on_topic)과 가장 먼 문장(off_topic)을 추출.
 
-        off_topic 판정 조건 (둘 다 만족해야 표시):
-          1. 절대 유사도가 ABS_OFF_TH(0.35) 미만
-          2. best_sim - worst_sim이 GAP_TH(0.20) 이상
-             → 전체적으로 주제에 맞는데 한 문장만 튀는 경우만 표시
-             → 전체가 다 낮으면 off_topic 문장이 따로 없는 것
+        _sents, _sims가 주어지면 내부 인코딩 생략 (predict()에서 사전 계산값 재사용).
 
-        반환:
-          on_topic_sentences : 유사도 상위 top_k_on개 문장
-          off_topic_sentences: 조건 만족 시 유사도 하위 top_k_off개 문장
+        off_topic 판정 조건 (둘 다 만족해야 표시):
+          1. 절대 유사도 < ABS_OFF_TH(0.35)
+          2. best_sim - worst_sim > GAP_TH(0.20)
+             → 전체가 다 낮으면 off_topic 문장이 따로 없는 것
         """
-        sents = split_sentences(doc)
+        if _sents is not None and _sims is not None:
+            sents, sims = _sents, _sims
+        else:
+            sents, _, _, sims = self._encode_sentences(anchor, doc)
+
         if len(sents) == 0:
             return {"on_topic_sentences": [], "off_topic_sentences": []}
         if len(sents) == 1:
             return {"on_topic_sentences": sents, "off_topic_sentences": []}
 
-        anchor_vec = self.topic_model.encode([anchor], normalize_embeddings=True, convert_to_numpy=True)[0]
-        sent_vecs  = self.topic_model.encode(sents,   normalize_embeddings=True, convert_to_numpy=True)
-        sims       = sent_vecs @ anchor_vec  # 각 문장의 anchor와의 유사도
+        order_desc = np.argsort(-sims)
+        order_asc  = np.argsort(sims)
+        best_sim   = float(sims[int(order_desc[0])])
+        worst_sim  = float(sims[int(order_asc[0])])
 
-        order_desc = np.argsort(-sims)  # 유사도 내림차순
-        order_asc  = np.argsort(sims)   # 유사도 오름차순
-
-        best_sim  = float(sims[int(order_desc[0])])
-        worst_sim = float(sims[int(order_asc[0])])
-
-        on_sents = [sents[int(i)] for i in order_desc[:top_k_on]]
-
-        # off_topic 조건: 절대값이 낮고 다른 문장과 격차가 클 때만 표시
+        on_sents  = [sents[int(i)] for i in order_desc[:top_k_on]]
         off_sents: List[str] = []
         if worst_sim < abs_off_th and (best_sim - worst_sim) > gap_th:
             off_sents = [sents[int(i)] for i in order_asc[:top_k_off]]
@@ -238,31 +377,34 @@ class ServiceScorer:
         off_topic_th: float = ABS_OFF_TH,
         coherence_th: float = 0.40,
         quality_th: int = 35,
+        *,
+        _sents: Optional[List[str]] = None,
+        _sent_vecs: Optional[np.ndarray] = None,
+        _sims: Optional[np.ndarray] = None,
     ) -> List[Dict[str, Any]]:
         """
         문장별 상세 분석. LLM 피드백 생성 시 입력 데이터로 활용 예정.
 
+        _sents, _sent_vecs, _sims가 주어지면 내부 인코딩 생략 (predict()에서 재사용).
+        품질 점수는 _batch_quality_scores()로 배치 처리 (순차 호출 대비 속도 개선).
+
         각 문장마다 계산:
-          - topic_score   : anchor와의 코사인 유사도 → 0~100
-          - coherence_sim : 앞뒤 인접 문장과의 평균 유사도 (흐름 연속성)
-                            첫 문장/마지막 문장은 한쪽만 계산
-          - quality_score : label_model로 문장 품질 → 0~100
-          - flags         : 해당 문장의 문제 유형 목록
-            "off_topic"    : topic_score가 off_topic_th(0.35) 미만
-            "low_coherence": coherence_sim이 coherence_th(0.40) 미만
-            "low_quality"  : quality_score가 quality_th(35) 미만
+          - topic_score   : anchor cosine → sim_to_topic_score() → 0~100
+          - coherence_sim : 인접 문장과의 평균 유사도
+          - quality_score : label_model 확률 가중합 → 0~100
+          - flags         : ["off_topic", "low_coherence", "low_quality"]
         """
-        sents = split_sentences(doc)
+        if _sents is not None and _sent_vecs is not None and _sims is not None:
+            sents, sent_vecs, topic_sims = _sents, _sent_vecs, list(_sims)
+        else:
+            sents, sent_vecs, _, sims_arr = self._encode_sentences(anchor, doc)
+            topic_sims = list(sims_arr) if len(sims_arr) > 0 else []
+
         if not sents:
             return []
 
-        anchor_vec = self.topic_model.encode(
-            [anchor], normalize_embeddings=True, convert_to_numpy=True
-        )[0]
-        sent_vecs  = self.topic_model.encode(
-            sents, normalize_embeddings=True, convert_to_numpy=True
-        )
-        topic_sims = (sent_vecs @ anchor_vec).tolist()
+        # ── 품질 점수 배치 계산 (문장마다 개별 호출 → 1회 배치로 대체) ────
+        q_raws = self._batch_quality_scores(sents)   # List[float], 0~2
 
         results = []
         for i, (sent, tvec) in enumerate(zip(sents, sent_vecs)):
@@ -277,9 +419,7 @@ class ServiceScorer:
                 neighbors.append(float(sent_vecs[i + 1] @ tvec))
             coherence_sim = float(np.mean(neighbors)) if neighbors else None
 
-            # 문장 단위 품질 점수
-            q_raw         = self.quality_score(sent)            # 0~2
-            quality_score = int(min(100, round(q_raw * 50)))    # 0~100
+            quality_score = int(min(100, round(q_raws[i] * 50)))
 
             flags = []
             if tsim < off_topic_th:
@@ -312,53 +452,83 @@ class ServiceScorer:
 
         처리 순서:
           1. anchor 텍스트 생성
-          2. topic_model로 코사인 유사도 계산 → 0~3 캘리브레이션
-          3. label_model로 품질 점수 계산 → 0~3 스케일 맞춤
-          4. 가중평균(ALPHA=0.35) → 최종 점수 0~100
-          5. on_topic 판정 (False면 final=0 강제)
-          6. sentence_evidence: on/off topic 문장 추출
-          7. sentence_analysis: 문장별 상세 분석
-          8. worst_sentence: 유사도 가장 낮은 문장 1개 추출
+          2. _encode_sentences(): 문장 분리 + 임베딩 1회 수행
+          3. _aggregate_topic(): 문장별 sim 집계 → topic_score_3
+          4. quality_score(): 전체 문서 품질 → q_3
+          5. 가중평균(ALPHA=0.35) → final_100
+          6. on_topic 판정: topic_avg < T_OFF_SIM → final=0 강제
+          7. sentence_evidence / sentence_analysis (사전 계산 벡터 재사용)
+          8. worst_sentence: topic_score 최하위 문장 추출
 
         반환 구조:
-          on_topic         : 주제 적합 여부 (bool)
-          scores           : final/topic/quality 점수 (0~100)
-          keywords         : TF-IDF 핵심 키워드 5개
-          evidence         : on/off topic 대표 문장
-          sentence_analysis: 문장별 분석 리스트
-          worst_sentence   : topic_score 최하위 문장 (LLM 피드백용)
-          debug            : 내부 계산값 (debug=True일 때만 포함)
+          on_topic          : 주제 적합 여부 (bool)
+          scores            : { final, topic, quality } (0~100)
+          keywords          : TF-IDF 핵심 키워드 5개
+          evidence          : { on_topic_sentences, off_topic_sentences }
+          sentence_analysis : 문장별 분석 리스트
+          worst_sentence    : topic_score 최하위 문장 (LLM 피드백용)
+          debug             : 내부 계산값 (debug=True일 때만 포함)
         """
         anchor = build_anchor_text(topic_summary, topic_desc, topic_tags)
 
-        # ── 점수 계산 ──────────────────────────────────────────────────────────
-        sim          = self.topic_similarity(anchor, doc_text)
-        topic_score_3 = sim_to_topic_score(sim)       # 0~3
+        # ── 문장 분리 + 임베딩 (1회만 수행) ──────────────────────────────────
+        sents, sent_vecs, anchor_vec, sims = self._encode_sentences(anchor, doc_text)
 
-        q_2   = self.quality_score(doc_text)           # 0~2 연속값
-        q_3   = q_2 * 1.5                              # 0~3 스케일로 맞춤 (topic과 동일 범위)
-        final_3 = ALPHA * topic_score_3 + (1.0 - ALPHA) * q_3  # 가중평균
+        # 빈 텍스트 early return
+        if not sents:
+            return {
+                "on_topic": False,
+                "scores":   {"final": 0, "topic": 0, "quality": 0},
+                "keywords": [],
+                "evidence": {"on_topic_sentences": [], "off_topic_sentences": []},
+                "sentence_analysis": [],
+                "worst_sentence":    None,
+            }
 
-        on_topic = sim >= T_OFF_SIM  # 유사도 0.30 미만이면 주제 이탈
+        # ── topic score (문장 수준 집계) ──────────────────────────────────────
+        topic_score_3, agg_debug = self._aggregate_topic(sims, sent_vecs)
+
+        # ── quality score (전체 문서 기준) ────────────────────────────────────
+        q_2     = self.quality_score(doc_text)   # 0~2
+        q_3     = q_2 * 1.5                       # 0~3 스케일 맞춤
+
+        # ── 가중평균 ──────────────────────────────────────────────────────────
+        final_3 = ALPHA * topic_score_3 + (1.0 - ALPHA) * q_3
+
+        # ── on/off topic 판정 (3가지 조건 AND) ──────────────────────────────
+        # KoSimCSE cosine baseline 문제로 인한 false positive 방지:
+        #   단일 threshold로는 무관한 텍스트도 0.30+ 나와 통과 가능
+        #   → avg / min / off_ratio 세 조건 모두 만족해야 on_topic
+        topic_avg = agg_debug.get("topic_avg", float(np.mean(sims)))
+        topic_min = agg_debug.get("topic_min", float(np.min(sims)))
+        off_ratio = agg_debug.get("off_ratio", float(np.mean(sims < PENALTY_TH)))
+
+        cond_avg      = topic_avg >= T_OFF_SIM
+        cond_min      = topic_min >= MIN_SIM_TH
+        cond_off_ratio = off_ratio < OFF_RATIO_TH
+        on_topic      = cond_avg and cond_min and cond_off_ratio
 
         topic_100   = score3_to_100(topic_score_3)
-        quality_100 = int(min(100, round(q_2 * 50)))   # 0~2 → 0~100
+        quality_100 = int(min(100, round(q_2 * 50)))
         final_100   = score3_to_100(final_3)
         if not on_topic:
-            final_100 = 0  # 주제 이탈 시 최종 점수 0점 처리
+            final_100 = 0
 
-        # ── 부가 정보 생성 ─────────────────────────────────────────────────────
+        # ── 부가 정보 생성 (사전 계산 벡터 재사용) ───────────────────────────
         if on_topic and topic_100 > 45:
-            # 주제에 맞는 경우만 on/off 문장 구분
-            evidence = self.sentence_evidence(anchor, doc_text)
+            evidence = self.sentence_evidence(
+                anchor, doc_text, _sents=sents, _sims=sims
+            )
         else:
-            # 전체가 주제 이탈이면 모든 문장을 off_topic으로 표시
-            evidence = {"on_topic_sentences": [], "off_topic_sentences": split_sentences(doc_text)}
+            # 전체 주제 이탈 시 모든 문장을 off_topic으로 표시
+            evidence = {"on_topic_sentences": [], "off_topic_sentences": sents}
 
-        sent_analysis = self.sentence_analysis(anchor, doc_text)
+        sent_analysis = self.sentence_analysis(
+            anchor, doc_text,
+            _sents=sents, _sent_vecs=sent_vecs, _sims=sims,
+        )
 
-        # ── worst_sentence: 유사도 가장 낮은 문장 추출 ────────────────────────
-        # LLM 피드백 생성 시 "가장 문제 있는 문장"으로 활용 예정
+        # ── worst_sentence: topic_score 최하위 문장 (LLM 피드백용) ───────────
         worst_sentence = None
         if sent_analysis:
             worst = min(sent_analysis, key=lambda x: x["topic_score"])
@@ -375,26 +545,37 @@ class ServiceScorer:
                 "topic":   topic_100,
                 "quality": quality_100,
             },
-            "keywords":         extract_keywords(doc_text, top_n=5),
-            "evidence":         evidence,
+            "keywords":          extract_keywords(doc_text, top_n=5),
+            "evidence":          evidence,
             "sentence_analysis": sent_analysis,
-            "worst_sentence":   worst_sentence,
+            "worst_sentence":    worst_sentence,
         }
 
         if debug:
             result["debug"] = {
-                "sim_raw":        round(sim, 4),
-                "topic_score_3":  round(topic_score_3, 2),
-                "quality_class":  int(round(q_2)),   # 0=낮음, 1=보통, 2=높음
+                **agg_debug,
+                "quality_class":   int(round(q_2)),
                 "quality_score_2": round(q_2, 2),
-                "final_score_3":  round(final_3, 2),
+                "topic_score_3":   round(topic_score_3, 2),
+                "final_score_3":   round(final_3, 2),
+                "on_topic_reason": {
+                    "cond_avg":       f"topic_avg({topic_avg:.3f}) >= T_OFF_SIM({T_OFF_SIM}) → {cond_avg}",
+                    "cond_min":       f"topic_min({topic_min:.3f}) >= MIN_SIM_TH({MIN_SIM_TH}) → {cond_min}",
+                    "cond_off_ratio": f"off_ratio({off_ratio:.3f}) < OFF_RATIO_TH({OFF_RATIO_TH}) → {cond_off_ratio}",
+                    "result":         on_topic,
+                },
                 "calib": {
-                    "SIM_MIN":    SIM_MIN,
-                    "SIM_MAX":    SIM_MAX,
-                    "T_OFF_SIM":  T_OFF_SIM,
-                    "ALPHA":      ALPHA,
-                    "ABS_OFF_TH": ABS_OFF_TH,
-                    "GAP_TH":     GAP_TH,
+                    "T_OFF_SIM":    T_OFF_SIM,
+                    "MIN_SIM_TH":   MIN_SIM_TH,
+                    "OFF_RATIO_TH": OFF_RATIO_TH,
+                    "ALPHA":        ALPHA,
+                    "W_AVG":        W_AVG,
+                    "W_MIN":        W_MIN,
+                    "W_COH":        W_COH,
+                    "PENALTY_TH":   PENALTY_TH,
+                    "PENALTY_W":    PENALTY_W,
+                    "ABS_OFF_TH":   ABS_OFF_TH,
+                    "GAP_TH":       GAP_TH,
                 }
             }
 
