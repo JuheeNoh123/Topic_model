@@ -7,8 +7,13 @@
 #   2. label_model     : 문장 품질 평가 (klue/roberta-base 파인튜닝)
 #
 # 전체 채점 흐름:
-#   anchor 생성 → 코사인 유사도 계산 → 0~3 캘리브레이션
-#   → quality score 계산 → 가중평균(topic 35% : quality 65%)
+#   anchor 생성
+#   → 문장 분리 + anchor/문장 임베딩 (1회만 수행)
+#   → _aggregate_topic():
+#       topic_avg / topic_min / coherence 가중합
+#       → 동적 percentile 정규화 → 0~3
+#       → off-topic 문장 비율 기반 penalty 감점
+#   → quality_score(): 전체 문서 품질 → 가중평균 (topic 35% : quality 65%)
 #   → 0~100 변환 → 문장별 분석 → worst_sentence 추출
 #
 # main.py의 /score 엔드포인트에서 이 클래스를 사용.
@@ -16,7 +21,7 @@
 
 import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 
 import numpy as np
 import torch
@@ -27,24 +32,33 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 # ── 경로 설정 ─────────────────────────────────────────────────────────────────
 BASE_DIR         = Path(__file__).resolve().parent
-TOPIC_MODEL_PATH = BASE_DIR / "topic_model_mnr"  # KoSimCSE 파인튜닝 모델
-LABEL_MODEL_PATH = BASE_DIR / "label_model"      # klue/roberta-base 파인튜닝 모델
+TOPIC_MODEL_PATH = BASE_DIR / "topic_model_mnr"
+LABEL_MODEL_PATH = BASE_DIR / "label_model"
 
 
-# ── 캘리브레이션 파라미터 ─────────────────────────────────────────────────────
-# calc_margin_stats.py 실행 결과(valid 데이터 분포)를 보고 설정한 값.
-# 코사인 유사도가 이 범위 안에 있는 데이터가 대부분 → 이 범위를 0~3으로 선형 매핑.
-SIM_MIN = 0.15   # 유사도 이 값 이하 → 0점에 가까운 수준 (p05 기준)
-SIM_MAX = 0.90   # 유사도 이 값 이상 → 최고점 수준 (p95 기준)
+# ── 정규화 파라미터 (fallback) ────────────────────────────────────────────────
+# 문장 수가 MIN_SENTS_PERCENTILE 미만일 때 아래 값으로 대체.
+SIM_MIN = 0.15
+SIM_MAX = 0.90
 
-# on/off topic 판정 threshold
-# 코사인 유사도가 이 값 미만이면 주제 이탈로 판정 → final 점수 0점 처리
-T_OFF_SIM = 0.30
+# 동적 정규화: 현재 문서의 문장별 similarity 분포에서 percentile로 결정
+# → 도메인/주제에 따른 절대 수치 편차를 흡수
+SIM_NORM_P_LOW       = 5    # 하위 5% → SIM_MIN 역할
+SIM_NORM_P_HIGH      = 95   # 상위 95% → SIM_MAX 역할
+MIN_SENTS_PERCENTILE = 4    # percentile 계산에 필요한 최소 문장 수
+
+# ── on/off topic 판정 파라미터 ──────────────────────────────────────────────
+# KoSimCSE 특성상 한국어 텍스트 간 cosine baseline이 0.25~0.40 수준이므로
+# 단일 threshold 0.30으로는 false positive 발생 → 3가지 조건 AND로 강화
+#
+# 조건 1: topic_avg >= T_OFF_SIM   전반적 평균 유사도
+# 조건 2: topic_min >= MIN_SIM_TH  가장 이탈한 문장도 최소 기준 이상
+# 조건 3: off_ratio < OFF_RATIO_TH off-topic 문장 비율이 일정 미만
+T_OFF_SIM    = 0.42   # topic_avg 기준 (기존 0.30 → 상향)
+MIN_SIM_TH   = 0.30   # topic_min 하한 (가장 낮은 문장도 이 값 이상이어야 함)
+OFF_RATIO_TH = 0.30   # off-topic 문장 비율 상한 (30% 이상이면 off-topic 처리)
 
 # 최종 점수 가중평균 비율
-# topic 점수보다 quality 점수 비중을 높게 설정한 이유:
-# on/off 판정이 이미 topic 적합성을 1차로 걸러주기 때문에
-# 점수 산출에서는 글 품질 비중을 더 크게 반영
 ALPHA = 0.35  # final = 0.35 × topic_score + 0.65 × quality_score
 
 
@@ -122,11 +136,7 @@ def split_sentences(text: str) -> List[str]:
 def extract_keywords(text: str, top_n: int = 5) -> List[str]:
     """
     TF-IDF 기반 핵심 키워드 추출.
-
-    단일 문서 TF-IDF는 사실상 "자주 등장하는 중요 단어" 추출.
-    형태소 분석 없이도 동작하는 MVP 수준으로 구현.
     중복 방지: 이미 뽑힌 키워드의 부분 문자열이면 스킵.
-    LLM 피드백 단계에서 주제 핵심어로 활용 예정.
     """
     if not text.strip():
         return []
@@ -142,7 +152,7 @@ def extract_keywords(text: str, top_n: int = 5) -> List[str]:
             break
         t = terms[i]
         if any(t in existing or existing in t for existing in out):
-            continue  # 중복 키워드 스킵
+            continue
         out.append(t)
         if len(out) >= top_n:
             break
@@ -587,11 +597,10 @@ if __name__ == "__main__":
     scorer = ServiceScorer()
 
     result = scorer.predict(
-        topic_summary="사업 성공 요인",
-        topic_desc="사업 아이템을 선택할 때 고려하면 좋은 것들. 현재 유행들.",
-        topic_tags=["#사업", "#아이템", "#유행"],
-        doc_text="두바이쫀득쿠키는 SNS 바이럴 마케팅과 한정판 전략을 통해 소비자들의 관심을 끌었습니다. "
-                 "이러한 전략은 브랜드 가치를 높이고 매출 상승으로 이어졌습니다.",
+        topic_summary="연애의 어려움",
+        topic_desc="이성 관계에서 겪는 고민과 감정",
+        topic_tags=["#연애", "#이성", "#감정"],
+        doc_text="오늘 도서관에서 경제학 책을 빌렸습니다. GDP와 환율의 상관관계가 흥미로웠습니다.",
         debug=True
     )
 
